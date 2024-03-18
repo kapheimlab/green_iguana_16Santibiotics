@@ -1,0 +1,420 @@
+---
+title: "green iguana antibiotics - part 2"
+author: "Karen M. Kapheim"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+
+# Information
+
+This is part 2 of the green iguana 16S antibiotics X LPS analysis. Part 1 does 
+all of the preprocessing steps, and then analyzes each timepoint separately. 
+However, based on the physiology, it may make more sense to do a 3-way analysis 
+of time * abx * lps. Doing that here.
+
+# Set up
+
+```{r library}
+library(tidyverse)
+library(phyloseq)
+library(vegan)
+library(microbiome)
+library(RVAideMemoire)
+library(qiime2R)
+library(nortest)
+library(glmm)
+library(lme4)
+library(lmerTest)
+library(emmeans)
+library(car)
+library(DESeq2)
+library(decontam)
+library(data.table)
+library(MASS)
+library(performance)
+```
+
+
+# Get data
+
+```{r data}
+load(file = "abx16sdata.RDA")
+```
+
+
+# Ordination plots
+
+#### PCoA with Bray-Curtis dissimilarity - Log-transformed data
+
+
+```{r ordination-1}
+ord.log.pcoa.bray <- ordinate(ps.log, 
+                                   method = "PCoA", 
+                                   distance = "bray")
+plot_ordination(ps.log, 
+                ord.log.pcoa.bray, 
+                type = "samples", 
+                color = "tx", shape = "timepoint") + 
+  geom_point(size = 4, alpha = 1) + 
+  scale_shape_manual(values = c(15,19,17,18)) + 
+  scale_color_manual(values = c("#678e73", "#170408", "#b8ab03", "#ccbb7a", "lightblue", "#00b0c0")) 
+```
+
+# Community differences on relative abundance
+
+Following advice from https://github.com/joey711/phyloseq/issues/689.
+I am using distance matrices based on relative abundance as a normalization 
+method, but can repeat with rarefied data. 
+In the second instance, I stratified permutations across 
+iguana. This should deal with repeated sampling.
+
+#### Overall model
+
+```{r adonis-1}
+bc.ps.t <- phyloseq::distance(ps.rab, method = "bray")
+samples.ps <- phyloseq::sample_data(ps)
+adonis.ps.t <- vegan::adonis2(bc.ps.t ~ samples.ps$tx_time, 
+                                strata = samples.ps$iguanaID, 
+                                permutations = 9999)
+adonis.ps.t
+```
+
+###### Pairwise testing
+
+```{r adonis-2b}
+pw_adonis.ps.t <- pairwise.perm.manova(bc.ps.t, 
+                                            samples.ps$tx_time, 
+                                            p.method = "BH", 
+                                            nperm = 9999)
+pw_adonis.ps.t
+```
+
+# Dispersion
+
+It is important to know how much of thes significnat differences in overall 
+microbiome composition found with adonis are due to differences in dispersion 
+(i.e., variance) within the sample type.
+
+Based on relative abundance
+
+
+```{r d.dispersion-1}
+beta.ps.t <- betadisper(bc.ps.t, 
+                          samples.ps$tx_time, 
+                          bias.adjust = TRUE)
+beta.ps.t
+beta.ps.t.an <- anova(beta.ps.t)
+beta.ps.t.an
+beta.ps.t.test <- permutest(beta.ps.t, 
+                            control = permControl(nperm = 9999),  
+                            pairwise=TRUE)
+beta.ps.t.test
+beta.ps.t.HSD <- TukeyHSD(beta.ps.t)
+beta.ps.t.HSD
+```
+
+No differences in dispersion.
+
+# Alpha diversity
+
+## Shannon Index
+
+
+###### Estimate diversity
+
+Using a non-filtered phyloseq object after warning received when using 'ps'. \
+Warning said better to use non-filtered data. It detected this based on few \
+singletons.
+
+
+```{r alpha-1}
+samples.ps.decon <- phyloseq::sample_data(ps.decon)
+ps.shannon <- estimate_richness(ps.decon,split=TRUE, 
+                                  measures = c("Observed","Shannon"))
+samples.ps.shannon <- merge(samples.ps.decon, 
+                              ps.shannon, 
+                              by=0, all = TRUE)
+levels(samples.ps.shannon$abx)
+levels(samples.ps.shannon$tx)
+```
+NOTE: This generates a warning error about singletons. 
+However, this does not apply to the Shannon index. 
+
+From https://github.com/benjjneb/dada2/issues/214 
+
+> DADA2 does not call singletons, due to the difficulty of differentiating rare 
+singleton errors from real singleton variants.
+This means you should not use the output of DADA2 to estimate richness (eg. 
+Chao S1). However, you shouldn't have been doing that with the output of other 
+methods either, as the high levels of FP singletons made richness estimates 
+wrong anyway. Right now, I don't think a method exists that can make valid 
+richness estimates from high-throughput amplicon data due to the difficulty of 
+calling singletons accurately, and the sensitivity of richness estimation to 
+the number of singletons.
+Other measures of diversity that aren't totally reliant on singletons, eg. 
+Shannon/Simpson, are valid to use, and you can ignore the warning in phyloseq 
+when calculating those measures.
+
+#### Plot distribution
+
+```{r alpha-2}
+histogram(samples.ps.shannon$Shannon)
+qqp(samples.ps.shannon$Shannon, "norm")
+ad.test(samples.ps.shannon$Shannon)
+```
+
+###### Test for significant differences
+
+From https://www.juliapilowsky.com/2018/10/19/a-practical-guide-to-mixed-models-in-r/
+
+
+
+```{r alpha-3}
+shannon.m0 <- lmer(Shannon ~ abx * lps * timepoint + (1 | iguanaID), 
+                       data = samples.ps.shannon,
+                       REML = FALSE)
+summary(shannon.m0)
+Anova(shannon.m0)
+```
+
+IguanaID had a variance of 0 so remove.
+
+```{r alpha-4}
+shannon.m1 <- lm(Shannon ~ abx * lps * timepoint , 
+                       data = samples.ps.shannon,
+                       REML = FALSE)
+summary(shannon.m1)
+Anova(shannon.m1)
+```
+
+```{r alpha-5}
+shannon.m2 <- lm(Shannon ~ abx * timepoint , 
+                       data = samples.ps.shannon,
+                       REML = FALSE)
+summary(shannon.m2)
+Anova(shannon.m2)
+```
+
+
+```{r alapha-6}
+anova(shannon.m1, shannon.m2)
+AIC(shannon.m1)
+AIC(shannon.m2)
+```
+
+
+Use box-cox transformation
+
+```{r alpha-7}
+bc.shannon <- boxcox(Shannon + 0.01 ~  abx * timepoint , 
+                         data = samples.ps.shannon)
+trans.shannon <- bc.shannon$x[which.max(bc.shannon$y)]
+trans.shannon
+```
+
+
+```{r alpha-8}
+shannon.m3 <- lm(Shannon^trans.shannon ~ abx * timepoint, 
+                       data = samples.ps.shannon, 
+                       REML = FALSE)
+summary(shannon.m3)
+Anova(shannon.m3)
+```
+
+```{r alpha-9}
+emmeans(shannon.m3, list(pairwise ~ abx), adjust = "tukey")
+emmeans(shannon.m3, list(pairwise ~ timepoint), adjust = "tukey")
+emmeans(shannon.m3, list(pairwise ~ abx:timepoint), adjust = "tukey")
+```
+
+```{r alpha-10}
+samples.ps.shannon %>%
+  group_by(tx_time) %>% 
+  summarise_at(vars(Shannon), funs(median(., na.rm = TRUE)))
+```
+
+###### Plot
+
+
+
+```{r alpha-11}
+svg("alpha.svg")
+p.alpha <- ggplot(samples.ps.shannon, aes(x = tx_time, 
+                                    y = Shannon, 
+                                 fill = abx)) + 
+        geom_boxplot() + 
+        #annotate("text",x=1,y=5,label="p<0.0001") +
+        #annotate("text",x=2,y=5,label="p=0.02") +
+        scale_y_continuous(name = "Shannon Index") +
+       # scale_x_discrete(name = "Dose", 
+        #                 labels=c("High", 
+        #                          "Low")) +  
+        theme(text = element_text(color="black",size = 14), 
+              axis.title = element_text(color="black"), 
+              axis.text.x = element_text(color="black",size = 6), 
+              axis.text.y = element_text(color="black",size = 12), 
+              legend.background = element_blank(),
+              legend.title = element_blank(),
+              panel.background = element_rect(fill = "white"),
+              panel.border = element_blank(),
+              panel.grid.major = element_blank(),
+              panel.grid.minor = element_blank(),
+              axis.line = element_line(size = 0.5, 
+                                       linetype = "solid", 
+                                       colour = "black")) + 
+  scale_fill_manual(values = c("#ee9b00","#94d2bd", "lightblue")) +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1), 
+          strip.background = element_rect(color = "#acacac",
+                                          fill = "#acacac"),
+          strip.text = element_text(size = 14,
+                                    face = "bold"))
+print(p.alpha)
+dev.off()
+p.alpha
+```
+
+
+## Species Richness
+
+Count data, so following:   
+https://stats.oarc.ucla.edu/r/dae/negative-binomial-regression/
+
+
+###### Distribution
+
+Check if negative binomial is appropriate for this dataset.
+
+```{r alpha-12}
+ggplot(samples.ps.shannon, aes(Observed, fill = tx_time)) + 
+  geom_histogram(binwidth = 1) + 
+  facet_grid(abx ~ ., margins = TRUE, scales = "free")
+with(samples.ps.shannon, tapply(Observed, abx, function(x) {
+    sprintf("M (SD) = %1.2f (%1.2f)", mean(x), sd(x))
+}))
+```
+
+###### Test for significant differences
+
+Trying Poisson first, because conditional variance does not seem to be 
+higher than conditional mean in any group.
+
+```{r alpha-13}
+obs.m1 <- glm(Observed ~ abx * lps * timepoint, 
+                       data = samples.ps.shannon,
+                       family = poisson(link = "log"))
+check_overdispersion(obs.m1)
+```
+
+Overdispersion detected, so go with the negative binomial
+
+```{r alpha-14}
+obs.m2 <- glm.nb(Observed ~ abx * lps * timepoint, 
+                     data = samples.ps.shannon)
+summary(obs.m2)
+Anova(obs.m2)
+```
+
+```{r alpha-15}
+obs.m3 <- glm.nb(Observed ~ abx * timepoint, 
+                     data = samples.ps.shannon)
+summary(obs.m3)
+Anova(obs.m3)
+```
+
+```{r alpha-16}
+anova(obs.m3, obs.m2)
+AIC(obs.m2)
+AIC(obs.m3)
+```
+
+
+
+```{r alpha-17}
+emmeans(obs.m3, list(pairwise ~ abx), adjust = "tukey")
+emmeans(obs.m3, list(pairwise ~ timepoint), adjust = "tukey")
+emmeans(obs.m3, list(pairwise ~ abx:timepoint), adjust = "tukey")
+```
+
+```{r alpha-18}
+samples.ps.shannon %>%
+  group_by(tx_time) %>% 
+  summarise_at(vars(Observed), funs(median(., na.rm = TRUE)))
+```
+
+```{r alpha-19}
+svg("richness.svg")
+p.richness <- ggplot(samples.ps.shannon, aes(x = tx_time, 
+                                    y = Observed, 
+                                 fill = abx)) + 
+        geom_boxplot() + 
+        #annotate("text",x=1,y=5,label="p<0.0001") +
+        #annotate("text",x=2,y=5,label="p=0.02") +
+        scale_y_continuous(name = "Shannon Index") +
+       # scale_x_discrete(name = "Dose", 
+        #                 labels=c("High", 
+        #                          "Low")) +  
+        theme(text = element_text(color="black",size = 14), 
+              axis.title = element_text(color="black"), 
+              axis.text.x = element_text(color="black",size = 6), 
+              axis.text.y = element_text(color="black",size = 12), 
+              legend.background = element_blank(),
+              legend.title = element_blank(),
+              panel.background = element_rect(fill = "white"),
+              panel.border = element_blank(),
+              panel.grid.major = element_blank(),
+              panel.grid.minor = element_blank(),
+              axis.line = element_line(size = 0.5, 
+                                       linetype = "solid", 
+                                       colour = "black")) + 
+  scale_fill_manual(values = c("#ecc19c","#1e847f", "royalblue")) +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1), 
+          strip.background = element_rect(color = "#acacac",
+                                          fill = "#acacac"),
+          strip.text = element_text(size = 14,
+                                    face = "bold"))
+print(p.richness)
+dev.off()
+p.richness
+```
+
+# Differential Abundance
+
+
+#### DESeq2 - stats
+
+
+```{r dab-1}
+de <- phyloseq_to_deseq2(ps, ~ abx * lps * timepoint)
+geomean <- function(x,na.rm=TRUE){
+  exp(sum(log(x[x > 0]),na.rm=na.rm) / length(x))
+}
+de.geomeans <- apply(counts(de),1,geomean)
+de <- estimateSizeFactors(de,geoMeans = de.geomeans)
+de <- DESeq(de, fitType = "local")
+alpha = 0.05
+```
+
+###### DEGs - LPS main effect
+
+
+```{r dab-2}
+resultsNames(de)
+diffab.lps <- results(de, name = "lps_P_vs_L" )
+diffab.lps <- diffab.lps[order(diffab.lps$padj, 
+                                           na.last = NA),]
+diffab.lps.p05 <- diffab.lps[(diffab.lps$padj < 
+                                        alpha & !is.na(diffab.lps$padj)),]
+diffab.lps.p05 <- cbind(as(diffab.lps.p05, "data.frame"), 
+                           as(tax_table(ps)[rownames(diffab.lps.p05), ], 
+                              "matrix"))
+dim(diffab.lps.p05)
+table(diffab.lps.p05$Family, diffab.lps.p05$Phylum)
+write.csv(diffab.lps.p05, file = "diffab_lps_p05.csv", quote = FALSE, 
+          row.names = TRUE)
+```
+# Bookkeeping
+
+```{r book-1}
+sessionInfo()
+```

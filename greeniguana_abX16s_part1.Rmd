@@ -1,0 +1,1930 @@
+---
+title: "green iguana antibiotics - part 1"
+author: "Karen M. Kapheim"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+# Information
+
+This is analysis of 16S sequences from a green iguana lab study involving 
+antibiotics. The sequences were processed in qiime2; the pipeline is documented 
+in `qiim2_workflow_antibiotics_green_iguana_Dec2023.md`. 
+
+Notes about the experimental design from Claudia Ki Dec 18, 2023
+
+> To summarize, we took baseline samples before the study began (day0) and then 
+administered antibiotic treatments (clindamycin, penicillin, sterile water) for 
+3 days. After the 4th day, samples were collected again. Iguanas were either 
+given a LPS or PBS injection (3X2 design). We took samples 24hr, 1 week, and 2 
+week after (termination). 
+
+Notes about the experimental design from Claudia Ki Nov 3, 2023
+
+> I wanted to send along the phys data (there is a metadata tab) and the design 
+of the study. To summarize, we took baseline samples before the study began 
+(day0) and then administered antibiotic treatments (clindamycin, penicillin, 
+sterile water) for 3 days. After the 4th day, samples were collected again. 
+Iguanas were either given a LPS or PBS injection (3X2 design). We took samples 
+24hr, 1 week, and 2 week after (termination). 
+
+
+# Set up
+
+```{r library}
+library(tidyverse)
+library(phyloseq)
+library(vegan)
+library(microbiome)
+library(RVAideMemoire)
+library(qiime2R)
+library(nortest)
+library(glmm)
+library(lme4)
+library(lmerTest)
+library(emmeans)
+library(car)
+library(DESeq2)
+library(decontam)
+library(data.table)
+library(MASS)
+library(performance)
+```
+
+# Get data
+
+```{r data-1}
+key <- read_csv("abx_SampleIguanaKey.csv", 
+                col_types = list(
+                  sampleID = col_character(),
+                  iguanaID = col_character(), 
+                  date = col_date(format = "%D")
+                  )
+                )
+phys <- read_csv("AbxMasterData.csv", 
+                col_types = list(
+                  iguanaID = col_character(),
+                  abx = col_character(), 
+                  lps = col_character(),
+                  tx = col_character()
+                  )
+                )
+```
+
+#### Add the NTCs
+
+```{r data-2a}
+key.plus <- key %>% 
+  add_row(sampleID = "NTC1") %>% 
+  add_row(sampleID = "NTC2") %>% 
+  add_row(sampleID = "NTC3")
+```
+
+
+#### Merge datasets
+
+```{r data-2b}
+merged <- key.plus %>% 
+  left_join(phys, by = "iguanaID")
+```
+
+#### Identify the extraction blanks
+
+```{r data-3}
+samples <- merged %>% 
+  mutate(blank = case_when(is.na(iguanaID) ~ "blank", 
+                           !is.na(iguanaID) ~"sample")) %>% 
+  relocate(blank, .after = sampleID) %>% 
+  mutate(timepoint = case_when(date == "2022-01-20" ~ "baseline", 
+                               date == "2022-01-24" ~ "24h", 
+                               date == "2022-02-08" ~ "2w")) %>% 
+  unite(tx_time, c(tx,timepoint), remove = FALSE) %>%  
+  relocate(timepoint, .after = lps)
+```
+
+#### Export modified sample data so that it can be added to phyloseq
+
+```{r data-4}
+write_delim(samples, "sample_data.txt", delim = "\t")
+```
+
+# Make phyloseq object
+
+#### Import files
+
+Following vignette from Qiime2R     
+[https://rdrr.io/github/jbisanz/qiime2R/f/vignettes/vignette.Rmd].
+
+```{r import-1a}
+SVs <- read_qza("abx_table.qza")
+taxonomy <- read_qza("abx_SILVA_138_99_taxonomy.qza")
+tree <- read_qza("rooted_tree.qza")
+```
+
+#### Make phyloseq object
+
+```{r import-2}
+physeq <- qza_to_phyloseq(features = "abx_table.qza", 
+                          tree = "rooted_tree.qza", 
+                         taxonomy = "abx_SILVA_138_99_taxonomy.qza", 
+                          metadata = "sample_data.txt")
+sample_data(physeq)$iguanaID <- as.character(sample_data(physeq)$iguanaID)
+sample_data(physeq)$date <- as_date(sample_data(physeq)$date)
+sample_data(physeq)
+physeq
+```
+
+
+## Check to make sure samples in metadata and feature table match up
+
+```{r import-4a}
+length(setdiff(samples$sampleID, colnames(SVs$data)))
+setdiff(samples$sampleID, colnames(SVs$data))
+```
+
+There are 2 samples in the sample data that we do not have seqs for:
+
+BG42 - a blank, so maybe not enough DNA to sequence
+GI361 - the notes in the extraction record say "No swab!"
+
+
+```{r import-4b}
+length(setdiff(colnames(SVs$data), samples$sampleID))
+setdiff(colnames(SVs$data), samples$sampleID)
+```
+
+
+```{r import-4c}
+length(setdiff(rownames(SVs$data), taxonomy$data$Feature.ID))
+length(setdiff(taxonomy$data$Feature.ID, rownames(SVs$data)))
+```
+
+Taxonomy matches up.
+
+## Convert the taxonomy table into a tabular split version     
+
+Also check number of unique taxa in the taxonomy table and the tree    
+
+```{r import-5, eval=FALSE, include=FALSE, echo=FALSE}
+taxtable <- taxonomy$data %>% as_tibble() %>% 
+  separate(Taxon,
+  sep=";", 
+  c("Kingdom","Phylum","Class","Order","Family","Genus","Species"))
+head(taxtable)
+# How many unique taxa?
+length(unique(taxtable[["Feature.ID"]]))
+#tree$data
+```
+
+Significantly fewer taxa than in the 3Y rock iguana study (7084)
+
+Inspect 
+
+
+```{r import-6, include = FALSE}
+ntaxa(physeq)
+nsamples(physeq)
+sample_names(physeq)[1:5]
+rank_names(physeq)
+sample_variables(physeq)
+otu_table(physeq)[1:3, 1:3]
+tax_table(physeq)[100:103, 1:3]
+phy_tree(physeq)
+taxa_names(physeq)[1:10]
+```
+
+# Preprocessing     
+Following tutorial [https://joey711.github.io/phyloseq/preprocess.html]   
+
+## Filter mitochondria and chloroplast
+
+D_4__Mitochondria (Family)
+D_3__Chloroplast (Order)
+
+```{r mtchloro-1}
+ntaxa(physeq)
+physeq_nomito <- subset_taxa(physeq, Family != "D_4__Mitochondria")
+ntaxa(physeq_nomito)
+physeq_nomitonochloro <- subset_taxa(physeq_nomito, Order != "D_3__Chloroplast")
+ntaxa(physeq_nomitonochloro)
+```
+
+123 mitochondria
+
+No chloroplast
+
+No chloroplast.
+
+## Decontaminate
+
+Following https://benjjneb.github.io/decontam/vignettes/decontam_intro.html
+
+#### Inspect library sizes
+
+```{r decon-1a}
+all.samples.df <- as.data.frame(sample_data(physeq_nomitonochloro))
+all.samples.df$LibrarySize <- sample_sums(physeq_nomitonochloro)
+all.samples.df <- all.samples.df[order(all.samples.df$LibrarySize),]
+all.samples.df$Index <- seq(nrow(all.samples.df))
+ggplot(data = all.samples.df, 
+       aes(x = Index, y = LibrarySize, color = blank )) + 
+  geom_point()
+ggplot(data = all.samples.df, 
+       aes(x = Index, y = LibrarySize, color = blank )) + 
+  ylim(0,200) + 
+  geom_point()
+```
+
+Blanks have very few reads - all under 150
+
+#### Identify contaminants - Prevalence
+
+Identifies contaminants based on presence/absence across samples and controls.
+
+```{r decon-2}
+sample_data(physeq_nomitonochloro)$is.neg <- 
+  sample_data(physeq_nomitonochloro)$blank == "blank"
+contamdf.prev <- isContaminant(physeq_nomitonochloro, 
+                               method = "prevalence", neg="is.neg")
+table(contamdf.prev$contaminant)
+head(which(contamdf.prev$contaminant))
+contamdf.prev[contamdf.prev[,"contaminant"] == "TRUE",]
+```
+
+Identifies 10 contaminants at the 0.1 threshold.
+
+Changing the threshold to 0.5 will identify contaminants as seqs that are \
+more prevalent in controls than in samples.
+
+```{r decon-3}
+contamdf.prev05 <- isContaminant(physeq_nomitonochloro, 
+                                 method = "prevalence", neg="is.neg",
+                                 threshold = 0.5)
+table(contamdf.prev05$contaminant)
+contamdf.prev05[contamdf.prev05[,"contaminant"] == "TRUE",]
+```
+
+There are 14 ASVs that are more prevalent in blanks than in samples. 
+
+#### Remove contaminants and blanks
+
+```{r decon-8}
+# remove contaminant taxa
+ntaxa(physeq_nomitonochloro)
+table(sample_data(physeq_nomitonochloro)$blank)
+contams <- row.names(contamdf.prev05[contamdf.prev05[,"contaminant"] == "FALSE",])
+length(contams)
+ps.decon <- prune_taxa(contams, physeq_nomitonochloro)
+# remove negative controls (blanks)
+ps.decon <- prune_samples(sample_data(ps.decon)$blank != "blank", ps.decon)
+nsamples(physeq_nomitonochloro)
+table(sample_data(ps.decon)$blank)
+ps.decon
+```
+
+
+## Filter taxa
+
+#### Look at distribution of taxa by Phylum 
+
+```{r ftax-1}
+#table(tax_table(ps.decon) [, "Phylum"], exclude = NULL)
+ps.decon.ftax <- subset_taxa(ps.decon, !is.na(Phylum))
+ps.decon
+ps.decon.ftax
+```
+
+All taxa were assigned to a phylum - no change.
+
+#### Assess feature prevalence   
+
+How many samples does each taxa show up in at least once?   
+
+Are there phyla that are comprised of mostly low-prevalence features?   
+
+Compute the total and average prevalences of the features in each phylum.
+
+```{r ftax-2}
+# Compute prevalence of each feature, store as data.frame
+prevdf = apply(X = otu_table(ps.decon.ftax),
+                 MARGIN = ifelse(taxa_are_rows(ps.decon.ftax), yes = 1, no = 2),
+                 FUN = function(x){sum(x > 0)})
+# Add taxonomy and total read counts to this data.frame
+prevDF = data.frame(Prevalence = prevdf,
+                      TotalAbundance = taxa_sums(ps.decon.ftax),
+                      tax_table(ps.decon.ftax))
+```
+
+#### Prevalence vs total read count 
+
+In this plot, each point is a different taxa.   
+
+```{r ftax-3, fig.width = 12}
+ggplot(prevDF, aes(Prevalence, TotalAbundance)) + 
+  geom_point(size = 4, alpha = 0.75) + 
+  scale_y_log10()
+```
+
+It shows the fraction of samples that each taxa within a phylum are found in.   
+
+Use this to eyeball selection of a minimum prevalence cutoff.   
+
+For now, I set the dotted line at 5% to see if that seems like a reasonable 
+cutoff.   
+
+```{r ftax-4, fig.width=12}
+ggplot(prevDF, aes(TotalAbundance, Prevalence / nsamples(ps.decon.ftax),
+                   color=Phylum)) + 
+  # Include a guess for parameter
+  geom_hline(yintercept = 0.05, alpha = 0.5, linetype = 2) + 
+  geom_point(size = 2, alpha = 0.7) +
+  scale_x_log10() +  xlab("Total Abundance") + 
+  ylab("Prevalence [Frac. Samples]") +
+  facet_wrap(~Phylum) + 
+  theme(legend.position="none")  
+```
+
+#### Plot the frequency of taxa
+
+```{r ftax-5}
+# Determine the cutoff for OTU filtering
+tdt = data.table(tax_table(ps.decon.ftax),
+                 TotalCounts = taxa_sums(ps.decon.ftax),
+                 OTU = taxa_names(ps.decon.ftax))
+tdt[(TotalCounts <= 2), .N]
+ggplot(tdt, aes(TotalCounts)) + 
+  geom_histogram() + 
+  ggtitle("Histogram of Total Counts")
+```
+
+
+```{r ftax-6}
+# taxa cumulative sum
+taxcumsum = tdt[, .N, by = TotalCounts]
+setkey(taxcumsum, TotalCounts)
+taxcumsum[, CumSum := cumsum(N)]
+# Define the plot
+pCumSum = ggplot(taxcumsum, aes(TotalCounts, CumSum)) + 
+  geom_point() +
+  xlab("Filtering Threshold, Minimum Total Counts") +
+  ylab("taxa Filtered") +
+  ggtitle("taxa that would be filtered vs. the minimum count threshold")
+pCumSum
+```
+
+Zoom-in
+
+```{r ftax-7}
+pCumSum + xlim(0, 30)
+```
+
+
+#### Remove taxa not seen at least 5 times in at least 5% (n = 10) samples   
+
+```{r ftax-8}
+#prevalenceThreshold = 0.05 * nsamples(ps.decon.ftax)
+prevalenceThreshold = 10
+freqThreshold = 5
+keepTaxa <- rownames(prevDF)[prevDF$Prevalence >= 
+                               prevalenceThreshold & 
+                               prevDF$TotalAbundance > freqThreshold]
+length(keepTaxa)
+ps.decon.ftax
+ps.decon.ftax2 <- prune_taxa(keepTaxa, ps.decon.ftax)
+ps.decon.ftax2
+```
+
+Lose a lot of taxa - from 3022 to 889
+
+## Filter samples
+
+#### First get some summary statistics for sequencing depth
+
+
+```{r fsam-1}
+min(sample_sums(ps.decon.ftax2))
+max(sample_sums(ps.decon.ftax2))
+mean(sample_sums(ps.decon.ftax2))
+median(sample_sums(ps.decon.ftax2))
+sdt <- data.table(as(sample_data(ps.decon.ftax2), "data.frame"),
+                  TotalReads = sample_sums(ps.decon.ftax2), 
+                  keep.rownames = TRUE)
+setnames(sdt, "rn", "SampleID")
+ggplot(sdt, aes(TotalReads)) + 
+  geom_histogram() + 
+  ggtitle("sequencing depth") + 
+  xlab("read counts") 
+```
+
+Zoom-in
+
+```{r fsam-2}
+ggplot(sdt, aes(TotalReads)) + 
+  geom_histogram() + 
+  ggtitle("sequencing depth") + 
+  xlab("read counts") + 
+  xlim(0,1000) 
+```
+
+#### Remove samples with fewer than 1000 reads
+
+```{r fsam-3}
+nsamples(ps.decon.ftax2)
+ps.decon.ftax2.fsam <- prune_samples(sample_sums(ps.decon.ftax2) >= 1000, 
+                                     ps.decon.ftax2)
+nsamples(ps.decon.ftax2.fsam)
+#sample_sums(ps.decon.ftax2.fsam)
+```
+
+This leaves 197 samples.
+
+## Final pre-processing steps
+
+#### Rename to simplify
+
+```{r prep-1}
+ps <- ps.decon.ftax2.fsam
+```
+
+
+#### Transform and rarefy
+
+
+```{r prep-2}
+ps.rab <- transform_sample_counts(ps, function(x) x/sum(x))
+ps.log <- transform_sample_counts(ps, function(x) log(1 + x))
+ps.rare <- rarefy_even_depth(ps, rngseed = 123)
+ps.rare.rab <- transform_sample_counts(ps.rare, function(x) x/sum(x))
+ps.rare.log <- transform_sample_counts(ps.rare, function(x) log(1 + x))
+min(sample_sums(ps.rare))
+max(sample_sums(ps.rare))
+# also make a non-filtered rarefied set for alpha diversity
+ps.decon.rare <- rarefy_even_depth(ps.decon, rngseed = 123, 
+                                   sample.size = 1167)
+ps.decon.rare
+```
+
+
+#### Subset
+
+###### Separate by timepoint
+
+```{r prep-3}
+ps.base <- subset_samples(ps, timepoint == "baseline")
+ps.base
+ps.base.rab <- transform_sample_counts(ps.base, function(x) x / sum(x) )
+ps.base.log <- transform_sample_counts(ps.base, function(x) log(1 + x))
+ps.decon.base <- subset_samples(ps.decon, timepoint == "baseline")
+ps.rare.base <- subset_samples(ps.rare, timepoint == "baseline")
+ps.rare.base.rab <- transform_sample_counts(ps.rare.base, function(x) x / sum(x) )
+ps.rare.base.log <- transform_sample_counts(ps.rare.base, function(x) log(1 + x))
+ps.decon.rare.base <- subset_samples(ps.decon.rare, timepoint == "baseline")
+# 
+ps.24h <- subset_samples(ps, timepoint == "24h")
+ps.24h
+ps.24h.rab <- transform_sample_counts(ps.24h, function(x) x / sum(x) )
+ps.24h.log <- transform_sample_counts(ps.24h, function(x) log(1 + x))
+ps.decon.24h <- subset_samples(ps.decon, timepoint == "24h")
+ps.rare.24h <- subset_samples(ps.rare, timepoint == "24h")
+ps.rare.24h.rab <- transform_sample_counts(ps.rare.24h, function(x) x / sum(x) )
+ps.rare.24h.log <- transform_sample_counts(ps.rare.24h, function(x) log(1 + x))
+ps.decon.rare.24h <- subset_samples(ps.decon.rare, timepoint == "24h")
+#
+ps.2w <- subset_samples(ps, timepoint == "2w")
+ps.2w
+ps.2w.rab <- transform_sample_counts(ps.2w, function(x) x / sum(x) )
+ps.2w.log <- transform_sample_counts(ps.2w, function(x) log(1 + x))
+ps.decon.2w <- subset_samples(ps.decon, timepoint == "2w")
+ps.rare.2w <- subset_samples(ps.rare, timepoint == "2w")
+ps.rare.2w.rab <- transform_sample_counts(ps.rare.2w, function(x) x / sum(x) )
+ps.rare.2w.log <- transform_sample_counts(ps.rare.2w, function(x) log(1 + x))
+ps.decon.rare.2w <- subset_samples(ps.decon.rare, timepoint == "2w")
+```
+
+
+# Library sizes
+
+#### Plots
+
+```{r lib-1}
+samples.ps <- as.data.frame(phyloseq::sample_data(ps))
+samples.ps$LibrarySize <- sample_sums(ps)
+samples.ps <- samples.ps[order(samples.ps$LibrarySize),]
+samples.ps$Index <- seq(nrow(samples.ps))
+ggplot(data = samples.ps, 
+       aes(x = Index, y = LibrarySize, color = abx )) + 
+  geom_point()
+```
+
+```{r lib-2}
+svg("reads.svg")
+p.libsize <- ggplot(samples.ps, aes(x = timepoint, 
+                                    y = LibrarySize, 
+                                 fill = abx)) + 
+        geom_boxplot() + 
+        #annotate("text",x=1,y=5,label="") +
+        #annotate("text",x=2,y=5,label="") +
+        scale_y_continuous(name = "Number of reads") +
+        #scale_x_discrete(name = "Dose", 
+        #                 labels=c("High", 
+        #                          "Low")) +  
+        theme(text = element_text(color="black",size = 14), 
+              axis.title = element_text(color="black"), 
+              axis.text.x = element_text(color="black",size = 10), 
+              axis.text.y = element_text(color="black",size = 12), 
+              legend.background = element_blank(),
+              legend.title = element_blank(),
+              panel.background = element_rect(fill = "white"),
+              panel.border = element_blank(),
+              panel.grid.major = element_blank(),
+              panel.grid.minor = element_blank(),
+              axis.line = element_line(size = 0.5, 
+                                       linetype = "solid", 
+                                       colour = "black")) + 
+  scale_fill_manual(values = c("#ef9a3d","#248c64", "lightblue")) +
+    theme(strip.background = element_rect(color = "#acacac",
+                                          fill = "#acacac"),
+          strip.text = element_text(size = 14,
+                                    face = "bold"))
+print(p.libsize)
+dev.off()
+p.libsize
+```
+
+No obvious differences in the number of reads from each antibiotic treatment.
+
+
+
+# Barplots
+
+Do we want barplots? Come back to this.
+
+# Ordination plots
+
+#### PCoA with Bray-Curtis dissimilarity - Log-transformed data
+
+
+###### Baseline
+
+```{r ordination-2}
+ord.log.pcoa.bray.base <- ordinate(ps.base.log, 
+                                   method = "PCoA", 
+                                   distance = "bray")
+plot_ordination(ps.base.log, 
+                ord.log.pcoa.bray.base, 
+                type = "samples", 
+                color = "abx", shape = "lps") + 
+  geom_point(size = 4, alpha = 1) + 
+  scale_shape_manual(values = c(15,19,17,18)) + 
+  scale_color_manual(values = c("#ee9b00","#94d2bd", "lightblue")) 
+```
+
+
+###### 24h
+
+```{r ordination-3}
+ord.log.pcoa.bray.24h <- ordinate(ps.24h.log, 
+                                   method = "PCoA", 
+                                   distance = "bray")
+plot_ordination(ps.24h.log, 
+                ord.log.pcoa.bray.24h, 
+                type = "samples", 
+                color = "abx", shape = "lps") + 
+  geom_point(size = 4, alpha = 1) + 
+  scale_shape_manual(values = c(15,19,17,18)) + 
+  scale_color_manual(values = c("#ee9b00","#94d2bd", "lightblue")) 
+```
+
+###### 2 weeks
+
+```{r ordination-4}
+ord.log.pcoa.bray.2w <- ordinate(ps.2w.log, 
+                                   method = "PCoA", 
+                                   distance = "bray")
+plot_ordination(ps.2w.log, 
+                ord.log.pcoa.bray.2w, 
+                type = "samples", 
+                color = "abx", shape = "lps") + 
+  geom_point(size = 4, alpha = 1) + 
+  scale_shape_manual(values = c(15,19,17,18)) + 
+  scale_color_manual(values = c("#ee9b00","#94d2bd", "lightblue")) 
+```
+
+# Community differences on relative abundance
+
+Following advice from https://github.com/joey711/phyloseq/issues/689.
+I am using distance matrices based on relative abundance as a normalization 
+method, but can repeat with rarefied data. 
+In the second instance, I stratified permutations across 
+iguana. This should deal with repeated sampling.
+
+#### Baseline
+
+```{r adonis-1}
+bc.ps.t.base <- phyloseq::distance(ps.base.rab, method = "bray")
+samples.ps.base <- phyloseq::sample_data(ps.base)
+adonis.ps.t.base <- vegan::adonis2(bc.ps.t.base ~ samples.ps.base$abx + 
+                                samples.ps.base$lps + 
+                                samples.ps.base$abx * samples.ps.base$lps, 
+                                permutations = 9999)
+adonis.ps.t.base
+```
+
+No differences at baseline. This is what we expect.
+
+#### 24 h
+
+```{r adonis-2a}
+bc.ps.t.24h <- phyloseq::distance(ps.24h.rab, method = "bray")
+samples.ps.24h <- phyloseq::sample_data(ps.24h)
+adonis.ps.t.24h <- vegan::adonis2(bc.ps.t.24h ~ samples.ps.24h$abx + 
+                                samples.ps.24h$lps + 
+                                samples.ps.24h$abx * samples.ps.24h$lps, 
+                                permutations = 9999)
+adonis.ps.t.24h
+```
+
+Significant effect of abx and the interaction term.
+
+###### Pairwise testing
+
+```{r adonis-2b}
+pw_adonis.ps.t.24h <- pairwise.perm.manova(bc.ps.t.24h, 
+                                            samples.ps.24h$tx, 
+                                            p.method = "BH", 
+                                            nperm = 9999)
+pw_adonis.ps.t.24h
+```
+
+Significant differences between all groups except:
+
+- No effect of LPS when on cipro
+- No effect of LPS when on water
+
+```{r adonis-2c}
+pw_adonis.ps.t.24h.b <- pairwise.perm.manova(bc.ps.t.24h, 
+                                            samples.ps.24h$abx, 
+                                            p.method = "BH", 
+                                            nperm = 9999)
+pw_adonis.ps.t.24h.b
+```
+
+Significant differences between all the antibiotic treatments.
+
+
+#### 2 weeks
+
+```{r adonis-3a}
+bc.ps.t.2w <- phyloseq::distance(ps.2w.rab, method = "bray")
+samples.ps.2w <- phyloseq::sample_data(ps.2w)
+adonis.ps.t.2w <- vegan::adonis2(bc.ps.t.2w ~ samples.ps.2w$abx + 
+                                samples.ps.2w$lps + 
+                                samples.ps.2w$abx * samples.ps.2w$lps, 
+                                permutations = 9999)
+adonis.ps.t.2w
+```
+
+Significant effect of antibiotics.
+
+###### Pairwise testing
+
+```{r d.adonis-3b}
+pw_adonis.ps.t.2w <- pairwise.perm.manova(bc.ps.t.2w, 
+                                            samples.ps.2w$abx, 
+                                            p.method = "BH", 
+                                            nperm = 9999)
+pw_adonis.ps.t.2w
+```
+
+Significant differences between all antibiotic treatments.
+
+# Dispersion
+
+It is important to know how much of thes significnat differences in overall 
+microbiome composition found with adonis are due to differences in dispersion 
+(i.e., variance) within the sample type.
+
+Based on relative abundance
+
+#### 24 h
+
+```{r d.dispersion-1}
+beta.ps.t.24h1 <- betadisper(bc.ps.t.24h, 
+                          samples.ps.24h$tx, 
+                          bias.adjust = TRUE)
+beta.ps.t.24h1
+beta.ps.t.24h1.an <- anova(beta.ps.t.24h1)
+beta.ps.t.24h1.an
+beta.ps.t.24h1.test <- permutest(beta.ps.t.24h1, 
+                            control = permControl(nperm = 9999),  
+                            pairwise=TRUE)
+beta.ps.t.24h1.test
+beta.ps.t.24h1.HSD <- TukeyHSD(beta.ps.t.24h1)
+beta.ps.t.24h1.HSD
+```
+
+
+```{r d.dispersion-2}
+beta.ps.t.24h2 <- betadisper(bc.ps.t.24h, 
+                          samples.ps.24h$abx, 
+                          bias.adjust = TRUE)
+beta.ps.t.24h2
+beta.ps.t.24h2.an <- anova(beta.ps.t.24h2)
+beta.ps.t.24h2.an
+beta.ps.t.24h2.test <- permutest(beta.ps.t.24h2, 
+                            control = permControl(nperm = 9999),  
+                            pairwise=TRUE)
+beta.ps.t.24h2.test
+beta.ps.t.24h2.HSD <- TukeyHSD(beta.ps.t.24h2)
+beta.ps.t.24h2.HSD
+```
+
+No differences in dispersion between antibiotic treatments or 
+abxXlps treatments.
+
+#### 2 weeks
+
+```{r d.dispersion-3}
+beta.ps.t.2w <- betadisper(bc.ps.t.2w, 
+                          samples.ps.2w$abx, 
+                          bias.adjust = TRUE)
+beta.ps.t.2w
+beta.ps.t.2w.an <- anova(beta.ps.t.2w)
+beta.ps.t.2w.an
+beta.ps.t.2w.test <- permutest(beta.ps.t.2w, 
+                            control = permControl(nperm = 9999),  
+                            pairwise=TRUE)
+beta.ps.t.2w.test
+beta.ps.t.2w.HSD <- TukeyHSD(beta.ps.t.2w)
+beta.ps.t.2w.HSD
+```
+
+
+Significant differences in dispersion between water and cipro.
+
+# Alpha diversity
+
+## Shannon Index
+
+#### 24 h
+
+###### Estimate diversity
+
+Using a non-filtered phyloseq object after warning received when using 'ps'. \
+Warning said better to use non-filtered data. It detected this based on few \
+singletons.
+
+
+```{r 24h.alpha-1}
+samples.ps.decon.24h <- phyloseq::sample_data(ps.decon.24h)
+h24.ps.shannon <- estimate_richness(ps.decon.24h,split=TRUE, 
+                                  measures = c("Observed","Shannon"))
+samples.ps.24h.shannon <- merge(samples.ps.decon.24h, 
+                              h24.ps.shannon, 
+                              by=0, all = TRUE)
+levels(samples.ps.24h.shannon$abx)
+levels(samples.ps.24h.shannon$tx)
+```
+
+
+NOTE: This generates a warning error about singletons. 
+However, this does not apply to the Shannon index. 
+
+From https://github.com/benjjneb/dada2/issues/214 
+
+> DADA2 does not call singletons, due to the difficulty of differentiating rare 
+singleton errors from real singleton variants.
+This means you should not use the output of DADA2 to estimate richness (eg. 
+Chao S1). However, you shouldn't have been doing that with the output of other 
+methods either, as the high levels of FP singletons made richness estimates 
+wrong anyway. Right now, I don't think a method exists that can make valid 
+richness estimates from high-throughput amplicon data due to the difficulty of 
+calling singletons accurately, and the sensitivity of richness estimation to 
+the number of singletons.
+Other measures of diversity that aren't totally reliant on singletons, eg. 
+Shannon/Simpson, are valid to use, and you can ignore the warning in phyloseq 
+when calculating those measures.
+
+###### Plot distribution
+
+```{r 24h.alpha-2}
+histogram(samples.ps.24h.shannon$Shannon)
+qqp(samples.ps.24h.shannon$Shannon, "norm")
+ad.test(samples.ps.24h.shannon$Shannon)
+```
+
+
+###### Test for significant differences
+
+From https://www.juliapilowsky.com/2018/10/19/a-practical-guide-to-mixed-models-in-r/
+
+
+
+```{r 24h.alpha-3}
+# no transformation
+shannon.24h.m0 <- lm(Shannon ~ abx * lps, 
+                       data = samples.ps.24h.shannon,
+                       REML = FALSE)
+summary(shannon.24h.m0)
+Anova(shannon.24h.m0)
+```
+
+Use box-cox transformation
+
+```{r 24h.alpha-4a}
+bc.shannon.24h <- boxcox(Shannon + 0.01 ~  abx * lps , 
+                         data = samples.ps.24h.shannon)
+trans.shannon.24h <- bc.shannon.24h$x[which.max(bc.shannon.24h$y)]
+trans.shannon.24h
+```
+
+
+```{r 24h.alpha-4b}
+shannon.24h.m1 <- lm(Shannon^trans.shannon.24h ~ abx * lps, 
+                       data = samples.ps.24h.shannon, 
+                       REML = FALSE)
+summary(shannon.24h.m1)
+Anova(shannon.24h.m1)
+```
+
+
+
+```{r 24h.alpha-5}
+emmeans(shannon.24h.m1, list(pairwise ~ abx), adjust = "tukey")
+```
+
+Significant differences between cipro and water, penicillin and water.
+
+```{r 24h.alpha-6}
+samples.ps.24h.shannon %>%
+  group_by(abx, lps) %>% 
+  summarise_at(vars(Shannon), funs(median(., na.rm = TRUE)))
+```
+
+
+
+###### Plots
+
+
+
+```{r 24h.alpha-8}
+svg("alpha_24h.svg")
+p.alpha.24h <- ggplot(samples.ps.24h.shannon, aes(x = tx, 
+                                    y = Shannon, 
+                                 fill = abx)) + 
+        geom_boxplot() + 
+        #annotate("text",x=1,y=5,label="p<0.0001") +
+        #annotate("text",x=2,y=5,label="p=0.02") +
+        scale_y_continuous(name = "Shannon Index") +
+       # scale_x_discrete(name = "Dose", 
+        #                 labels=c("High", 
+        #                          "Low")) +  
+        theme(text = element_text(color="black",size = 14), 
+              axis.title = element_text(color="black"), 
+              axis.text.x = element_text(color="black",size = 10), 
+              axis.text.y = element_text(color="black",size = 12), 
+              legend.background = element_blank(),
+              legend.title = element_blank(),
+              panel.background = element_rect(fill = "white"),
+              panel.border = element_blank(),
+              panel.grid.major = element_blank(),
+              panel.grid.minor = element_blank(),
+              axis.line = element_line(size = 0.5, 
+                                       linetype = "solid", 
+                                       colour = "black")) + 
+  scale_fill_manual(values = c("#ee9b00","#94d2bd", "lightblue")) +
+    theme(strip.background = element_rect(color = "#acacac",
+                                          fill = "#acacac"),
+          strip.text = element_text(size = 14,
+                                    face = "bold"))
+print(p.alpha.24h)
+dev.off()
+p.alpha.24h
+```
+
+
+#### 2 weeks
+
+###### Estimate diversity
+
+Using a non-filtered phyloseq object after warning received when using 'ps'. \
+Warning said better to use non-filtered data. It detected this based on few \
+singletons.
+
+
+```{r 2w.alpha-1}
+samples.ps.decon.2w <- phyloseq::sample_data(ps.decon.2w)
+h24.ps.shannon <- estimate_richness(ps.decon.2w,split=TRUE, 
+                                  measures = c("Observed","Shannon"))
+samples.ps.2w.shannon <- merge(samples.ps.decon.2w, 
+                              h24.ps.shannon, 
+                              by=0, all = TRUE)
+levels(samples.ps.2w.shannon$abx)
+levels(samples.ps.2w.shannon$tx)
+```
+
+
+NOTE: This generates a warning error about singletons. 
+However, this does not apply to the Shannon index. 
+
+From https://github.com/benjjneb/dada2/issues/214 
+
+> DADA2 does not call singletons, due to the difficulty of differentiating rare 
+singleton errors from real singleton variants.
+This means you should not use the output of DADA2 to estimate richness (eg. 
+Chao S1). However, you shouldn't have been doing that with the output of other 
+methods either, as the high levels of FP singletons made richness estimates 
+wrong anyway. Right now, I don't think a method exists that can make valid 
+richness estimates from high-throughput amplicon data due to the difficulty of 
+calling singletons accurately, and the sensitivity of richness estimation to 
+the number of singletons.
+Other measures of diversity that aren't totally reliant on singletons, eg. 
+Shannon/Simpson, are valid to use, and you can ignore the warning in phyloseq 
+when calculating those measures.
+
+###### Plot distribution
+
+```{r 2w.alpha-2}
+histogram(samples.ps.2w.shannon$Shannon)
+qqp(samples.ps.2w.shannon$Shannon, "norm")
+ad.test(samples.ps.2w.shannon$Shannon)
+```
+
+
+###### Test for significant differences
+
+From https://www.juliapilowsky.com/2018/10/19/a-practical-guide-to-mixed-models-in-r/
+
+
+
+```{r 2w.alpha-3}
+# no transformation
+shannon.2w.m0 <- lm(Shannon ~ abx * lps, 
+                       data = samples.ps.2w.shannon,
+                       REML = FALSE)
+summary(shannon.2w.m0)
+Anova(shannon.2w.m0)
+```
+
+Use box-cox transformation
+
+```{r 2w.alpha-4a}
+bc.shannon.2w <- boxcox(Shannon + 0.01 ~  abx * lps , 
+                         data = samples.ps.2w.shannon)
+trans.shannon.2w <- bc.shannon.2w$x[which.max(bc.shannon.2w$y)]
+trans.shannon.2w
+```
+
+
+```{r 2w.alpha-4b}
+shannon.2w.m1 <- lm(Shannon^trans.shannon.2w ~ abx * lps, 
+                       data = samples.ps.2w.shannon, 
+                       REML = FALSE)
+summary(shannon.2w.m1)
+Anova(shannon.2w.m1)
+```
+
+
+
+```{r 2w.alpha-5}
+emmeans(shannon.2w.m1, list(pairwise ~ abx), adjust = "tukey")
+```
+Significant differences between cipro and penicillin, C-W, but not P-W.
+
+```{r 2w.alpha-6}
+samples.ps.2w.shannon %>%
+  group_by(abx, lps) %>% 
+  summarise_at(vars(Shannon), funs(median(., na.rm = TRUE)))
+```
+
+
+
+
+###### Plots
+
+
+```{r 2w.alpha-8}
+svg("alpha_2w.svg")
+p.alpha.2w <- ggplot(samples.ps.2w.shannon, aes(x = tx, 
+                                    y = Shannon, 
+                                 fill = abx)) + 
+        geom_boxplot() + 
+        #annotate("text",x=1,y=5,label="p<0.0001") +
+        #annotate("text",x=2,y=5,label="p=0.02") +
+        scale_y_continuous(name = "Shannon Index") +
+       # scale_x_discrete(name = "Dose", 
+        #                 labels=c("High", 
+        #                          "Low")) +  
+        theme(text = element_text(color="black",size = 14), 
+              axis.title = element_text(color="black"), 
+              axis.text.x = element_text(color="black",size = 10), 
+              axis.text.y = element_text(color="black",size = 12), 
+              legend.background = element_blank(),
+              legend.title = element_blank(),
+              panel.background = element_rect(fill = "white"),
+              panel.border = element_blank(),
+              panel.grid.major = element_blank(),
+              panel.grid.minor = element_blank(),
+              axis.line = element_line(size = 0.5, 
+                                       linetype = "solid", 
+                                       colour = "black")) + 
+  scale_fill_manual(values = c("#ee9b00","#94d2bd", "lightblue")) +
+    theme(strip.background = element_rect(color = "#acacac",
+                                          fill = "#acacac"),
+          strip.text = element_text(size = 14,
+                                    face = "bold"))
+print(p.alpha.2w)
+dev.off()
+p.alpha.2w
+```
+
+
+## Species Richness
+
+Count data, so following:   
+https://stats.oarc.ucla.edu/r/dae/negative-binomial-regression/
+
+#### 24 h
+
+###### Distribution
+
+Check if negative binomial is appropriate for this dataset.
+
+```{r 24h.alpha-9}
+ggplot(samples.ps.24h.shannon, aes(Observed, fill = abx)) + 
+  geom_histogram(binwidth = 1) + 
+  facet_grid(abx ~ ., margins = TRUE, scales = "free")
+with(samples.ps.24h.shannon, tapply(Observed, abx, function(x) {
+    sprintf("M (SD) = %1.2f (%1.2f)", mean(x), sd(x))
+}))
+```
+
+
+###### Test for significant differences
+
+Trying Poisson first, because conditional variance does not seem to be 
+higher than conditional mean in any group.
+
+```{r 24h.alpha-10}
+obs.24h.m1 <- glm(Observed ~ abx * lps, 
+                       data = samples.ps.24h.shannon,
+                       family = poisson(link = "log"))
+check_overdispersion(obs.24h.m1)
+```
+
+
+Overdispersion detected, so go with the negative binomial
+
+```{r 24h.alpha-11}
+obs.24h.m2 <- glm.nb(Observed ~ abx * lps, 
+                     data = samples.ps.24h.shannon)
+summary(obs.24h.m2)
+Anova(obs.24h.m2)
+```
+
+Is the model better without LPS or the interaction?
+
+```{r 24h.alpha-12}
+obs.24h.m3 <- glm.nb(Observed ~ abx, 
+                     data = samples.ps.24h.shannon)
+summary(obs.24h.m3)
+Anova(obs.24h.m3)
+```
+
+```{r 24h.alpha-13}
+anova(obs.24h.m3, obs.24h.m2)
+```
+
+No significant difference. GOing to use m2 to stay consistent with the way the 
+plots are made, even though AIC is 4 points lower for m3.
+
+```{r 24h.alpha-14}
+emmeans(obs.24h.m2, list(pairwise ~ abx), adjust = "tukey")
+```
+
+Significant differences between cipro and water, penicillin and water.
+
+
+
+
+```{r 24h.alpha-15}
+samples.ps.24h.shannon %>%
+  group_by(abx, lps) %>% 
+  summarise_at(vars(Observed), funs(median(., na.rm = TRUE)))
+```
+
+###### Plots
+
+```{r 24h.alpha-16}
+svg("richness_24h.svg")
+p.richness.24h <- ggplot(samples.ps.24h.shannon, aes(x = tx, 
+                                    y = Observed, 
+                                 fill = abx)) + 
+        geom_boxplot() + 
+        #annotate("text",x=1,y=5,label="") +
+        #annotate("text",x=2,y=5,label="") +
+        scale_y_continuous(name = "Observed ASVs") +
+        #scale_x_discrete(name = "Dose", 
+        #                 labels=c("High", 
+        #                          "Low")) +  
+        theme(text = element_text(color="black",size = 14), 
+              axis.title = element_text(color="black"), 
+              axis.text.x = element_text(color="black",size = 10), 
+              axis.text.y = element_text(color="black",size = 12), 
+              legend.background = element_blank(),
+              legend.title = element_blank(),
+              panel.background = element_rect(fill = "white"),
+              panel.border = element_blank(),
+              panel.grid.major = element_blank(),
+              panel.grid.minor = element_blank(),
+              axis.line = element_line(size = 0.5, 
+                                       linetype = "solid", 
+                                       colour = "black")) + 
+  scale_fill_manual(values = c("#ecc19c","#1e847f", "royalblue")) +
+    theme(strip.background = element_rect(color = "#acacac",
+                                          fill = "#acacac"),
+          strip.text = element_text(size = 14,
+                                    face = "bold"))
+print(p.richness.24h)
+dev.off()
+p.richness.24h
+```
+
+#### 2 weeks
+
+###### Distribution
+
+Check if negative binomial is appropriate for this dataset.
+
+```{r 2w.alpha-9}
+ggplot(samples.ps.2w.shannon, aes(Observed, fill = abx)) + 
+  geom_histogram(binwidth = 1) + 
+  facet_grid(abx ~ ., margins = TRUE, scales = "free")
+with(samples.ps.2w.shannon, tapply(Observed, abx, function(x) {
+    sprintf("M (SD) = %1.2f (%1.2f)", mean(x), sd(x))
+}))
+```
+
+
+###### Test for significant differences
+
+Trying Poisson first, because conditional variance does not seem to be 
+higher than conditional mean in any group.
+
+```{r 2w.alpha-10}
+obs.2w.m1 <- glm(Observed ~ abx * lps, 
+                       data = samples.ps.2w.shannon,
+                       family = poisson(link = "log"))
+check_overdispersion(obs.2w.m1)
+```
+
+
+Overdispersion detected, so go with the negative binomial
+
+```{r 2w.alpha-11}
+obs.2w.m2 <- glm.nb(Observed ~ abx * lps, 
+                     data = samples.ps.2w.shannon)
+summary(obs.2w.m2)
+Anova(obs.2w.m2)
+```
+
+Is the model better without LPS or the interaction?
+
+```{r 2w.alpha-12}
+obs.2w.m3 <- glm.nb(Observed ~ abx, 
+                     data = samples.ps.2w.shannon)
+summary(obs.2w.m3)
+Anova(obs.2w.m3)
+```
+
+```{r 2w.alpha-13}
+anova(obs.2w.m3, obs.2w.m2)
+```
+
+No significant difference. GOing to use m2 to stay consistent with the way the 
+plots are made, even though AIC is 4 points lower for m3.
+
+```{r 2w.alpha-14}
+emmeans(obs.2w.m2, list(pairwise ~ abx), adjust = "tukey")
+```
+
+Significant differences between cipro and water, penicillin and cipro, 
+but NOT penicillin and water. Seems like the effects of penicillin wear off 
+by 2 weeks.
+
+
+
+```{r 2w.alpha-15}
+samples.ps.2w.shannon %>%
+  group_by(abx, lps) %>% 
+  summarise_at(vars(Observed), funs(median(., na.rm = TRUE)))
+```
+
+
+###### Plots
+
+```{r 2w.alpha-16}
+svg("richness_2w.svg")
+p.richness.2w <- ggplot(samples.ps.2w.shannon, aes(x = tx, 
+                                    y = Observed, 
+                                 fill = abx)) + 
+        geom_boxplot() + 
+        #annotate("text",x=1,y=5,label="") +
+        #annotate("text",x=2,y=5,label="") +
+        scale_y_continuous(name = "Observed ASVs") +
+        #scale_x_discrete(name = "Dose", 
+        #                 labels=c("High", 
+        #                          "Low")) +  
+        theme(text = element_text(color="black",size = 14), 
+              axis.title = element_text(color="black"), 
+              axis.text.x = element_text(color="black",size = 10), 
+              axis.text.y = element_text(color="black",size = 12), 
+              legend.background = element_blank(),
+              legend.title = element_blank(),
+              panel.background = element_rect(fill = "white"),
+              panel.border = element_blank(),
+              panel.grid.major = element_blank(),
+              panel.grid.minor = element_blank(),
+              axis.line = element_line(size = 0.5, 
+                                       linetype = "solid", 
+                                       colour = "black")) + 
+  scale_fill_manual(values = c("#ecc19c","#1e847f", "royalblue")) +
+    theme(strip.background = element_rect(color = "#acacac",
+                                          fill = "#acacac"),
+          strip.text = element_text(size = 14,
+                                    face = "bold"))
+print(p.richness.2w)
+dev.off()
+p.richness.2w
+```
+
+# Differential Abundance
+
+## 24 h
+
+
+
+#### DESeq2 - stats
+
+
+```{r dab.24h-2}
+de.24h <- phyloseq_to_deseq2(ps.24h, ~ abx + lps)
+geomean <- function(x,na.rm=TRUE){
+  exp(sum(log(x[x > 0]),na.rm=na.rm) / length(x))
+}
+de.24h.geomeans <- apply(counts(de.24h),1,geomean)
+de.24h <- estimateSizeFactors(de.24h,geoMeans = de.24h.geomeans)
+de.24h <- DESeq(de.24h, fitType = "local")
+alpha = 0.05
+```
+
+Parse pairwise results The following code does fdr correction on a \
+gene-by-gene basis, which will have less power than using the \
+hierarchical method
+
+
+###### DEGs - Cipro 
+
+
+```{r dab.24h-3}
+resultsNames(de.24h)
+diffab.24h.cipro <- results(de.24h, contrast = c('abx', 'C', 'W'))
+diffab.24h.cipro <- diffab.24h.cipro[order(diffab.24h.cipro$padj, 
+                                           na.last = NA),]
+diffab.24h.cipro.p05 <- diffab.24h.cipro[(diffab.24h.cipro$padj < 
+                                        alpha & !is.na(diffab.24h.cipro$padj)),]
+diffab.24h.cipro.p05 <- cbind(as(diffab.24h.cipro.p05, "data.frame"), 
+                           as(tax_table(ps.24h)[rownames(diffab.24h.cipro.p05), ], 
+                              "matrix"))
+dim(diffab.24h.cipro.p05)
+table(diffab.24h.cipro.p05$Family, diffab.24h.cipro.p05$Phylum)
+write.csv(diffab.24h.cipro.p05, file = "diffab_24h_cipro_p05.csv", quote = FALSE, 
+          row.names = TRUE)
+```
+
+There are 68 ASVs differentially abundant between cipro and water treatments at 
+24 hours.
+
+###### DEGs - Penicillin 
+
+
+```{r dab.24h-4}
+diffab.24h.pen <- results(de.24h, contrast = c('abx', 'P', 'W'))
+diffab.24h.pen <- diffab.24h.pen[order(diffab.24h.pen$padj, 
+                                           na.last = NA),]
+diffab.24h.pen.p05 <- diffab.24h.pen[(diffab.24h.pen$padj < 
+                                        alpha & !is.na(diffab.24h.pen$padj)),]
+diffab.24h.pen.p05 <- cbind(as(diffab.24h.pen.p05, "data.frame"), 
+                           as(tax_table(ps.24h)[rownames(diffab.24h.pen.p05), ], 
+                              "matrix"))
+dim(diffab.24h.pen.p05)
+table(diffab.24h.pen.p05$Family, diffab.24h.pen.p05$Phylum)
+write.csv(diffab.24h.pen.p05, file = "diffab_24h_pen_p05.csv", quote = FALSE, 
+          row.names = TRUE)
+```
+
+There are 51 ASVs differentially abundant between penicillin and water 
+treatments at 24 hours.
+
+###### DEGs - LPS 
+
+
+```{r dab.24h-5}
+resultsNames(de.24h)
+diffab.24h.lps <- results(de.24h, contrast = c('lps', 'L', 'P'))
+diffab.24h.lps <- diffab.24h.lps[order(diffab.24h.lps$padj, 
+                                           na.last = NA),]
+diffab.24h.lps.p05 <- diffab.24h.lps[(diffab.24h.lps$padj < 
+                                        alpha & !is.na(diffab.24h.lps$padj)),]
+diffab.24h.lps.p05 <- cbind(as(diffab.24h.lps.p05, "data.frame"), 
+                           as(tax_table(ps.24h)[rownames(diffab.24h.lps.p05), ], 
+                              "matrix"))
+dim(diffab.24h.lps.p05)
+table(diffab.24h.lps.p05$Family, diffab.24h.lps.p05$Phylum)
+write.csv(diffab.24h.lps.p05, file = "diffab_24h_lps_p05.csv", quote = FALSE, 
+          row.names = TRUE)
+```
+
+There are only 3 taxa differentially abundant between LPS and PBS treatments 
+at 24 h.
+
+#### Similarity
+
+These are the families that change in abundance with either antibiotic treatment.
+
+
+```{r dab.24h-6}
+intersect(diffab.24h.cipro.p05$Family, diffab.24h.pen.p05$Family)
+```
+## 2 weeks
+
+#### DESeq2 - stats
+
+
+```{r dab.2w-2}
+de.2w <- phyloseq_to_deseq2(ps.2w, ~ abx + lps)
+geomean <- function(x,na.rm=TRUE){
+  exp(sum(log(x[x > 0]),na.rm=na.rm) / length(x))
+}
+de.2w.geomeans <- apply(counts(de.2w),1,geomean)
+de.2w <- estimateSizeFactors(de.2w,geoMeans = de.2w.geomeans)
+de.2w <- DESeq(de.2w, fitType = "local")
+alpha = 0.05
+```
+
+Parse pairwise results The following code does fdr correction on a \
+gene-by-gene basis, which will have less power than using the \
+hierarchical method
+
+
+###### DEGs - Cipro 
+
+
+```{r dab.2w-3}
+resultsNames(de.2w)
+diffab.2w.cipro <- results(de.2w, contrast = c('abx', 'C', 'W'))
+diffab.2w.cipro <- diffab.2w.cipro[order(diffab.2w.cipro$padj, 
+                                           na.last = NA),]
+diffab.2w.cipro.p05 <- diffab.2w.cipro[(diffab.2w.cipro$padj < 
+                                        alpha & !is.na(diffab.2w.cipro$padj)),]
+diffab.2w.cipro.p05 <- cbind(as(diffab.2w.cipro.p05, "data.frame"), 
+                           as(tax_table(ps.2w)[rownames(diffab.2w.cipro.p05), ], 
+                              "matrix"))
+dim(diffab.2w.cipro.p05)
+table(diffab.2w.cipro.p05$Family, diffab.2w.cipro.p05$Phylum)
+write.csv(diffab.2w.cipro.p05, file = "diffab_2w_cipro_p05.csv", quote = FALSE, 
+          row.names = TRUE)
+```
+
+There are 328 ASVs differentially abundant between cipro and water treatments at 
+2 weeks.
+
+###### DEGs - Penicillin 
+
+
+```{r dab.2w-4}
+diffab.2w.pen <- results(de.2w, contrast = c('abx', 'P', 'W'))
+diffab.2w.pen <- diffab.2w.pen[order(diffab.2w.pen$padj, 
+                                           na.last = NA),]
+diffab.2w.pen.p05 <- diffab.2w.pen[(diffab.2w.pen$padj < 
+                                        alpha & !is.na(diffab.2w.pen$padj)),]
+diffab.2w.pen.p05 <- cbind(as(diffab.2w.pen.p05, "data.frame"), 
+                           as(tax_table(ps.2w)[rownames(diffab.2w.pen.p05), ], 
+                              "matrix"))
+dim(diffab.2w.pen.p05)
+table(diffab.2w.pen.p05$Family, diffab.2w.pen.p05$Phylum)
+write.csv(diffab.2w.pen.p05, file = "diffab_2w_pen_p05.csv", quote = FALSE, 
+          row.names = TRUE)
+```
+
+There are 31 ASVs differentially abundant between penicillin and water 
+treatments at 2 weeks.
+
+###### DEGs - LPS 
+
+
+```{r dab.2w-5}
+resultsNames(de.2w)
+diffab.2w.lps <- results(de.2w, contrast = c('lps', 'L', 'P'))
+diffab.2w.lps <- diffab.2w.lps[order(diffab.2w.lps$padj, 
+                                           na.last = NA),]
+diffab.2w.lps.p05 <- diffab.2w.lps[(diffab.2w.lps$padj < 
+                                        alpha & !is.na(diffab.2w.lps$padj)),]
+diffab.2w.lps.p05 <- cbind(as(diffab.2w.lps.p05, "data.frame"), 
+                           as(tax_table(ps.2w)[rownames(diffab.2w.lps.p05), ], 
+                              "matrix"))
+dim(diffab.2w.lps.p05)
+table(diffab.2w.lps.p05$Family, diffab.2w.lps.p05$Phylum)
+write.csv(diffab.2w.lps.p05, file = "diffab_2w_lps_p05.csv", quote = FALSE, 
+          row.names = TRUE)
+```
+
+There are only 13 taxa differentially abundant between LPS and PBS treatments 
+at 2 weeks.
+
+#### Similarity
+
+How many of the dab families at 24 h are still dab at 2 weeks in each tx?
+
+###### Cipro
+
+```{r dab.2w-6}
+intersect(diffab.24h.cipro.p05$Family, diffab.2w.cipro.p05$Family)
+```
+
+###### Penicillin
+
+```{r dab.2w-7}
+intersect(diffab.24h.pen.p05$Family, diffab.2w.pen.p05$Family)
+```
+
+
+# Correlations
+
+Let's see if any of the differentially abundant taxa are correlated with BKA or 
+IgY. 
+
+
+## 24 h cipro
+
+#### Agglomerate by family 
+
+```{r cor.24h-1}
+ps.24h.fam <- tax_glom(ps.24h, 'Family')
+```
+
+#### Filter ASVs
+
+```{r cor.24h-2}
+keepTaxa <- rownames(diffab.24h.cipro.p05)
+length(keepTaxa)
+# ASVs
+ps.24h.dab.cipro <- prune_taxa(keepTaxa, ps.24h)
+ps.24h.dab.cipro
+# family
+ps.24h.fam.dab.cipro <- prune_taxa(keepTaxa, ps.24h.fam)
+ps.24h.fam.dab.cipro
+```
+
+###### Prep families
+
+```{r cor.24h-3}
+#
+ps.24h.fam.dab.cipro.otus <- abundances(ps.24h.fam.dab.cipro)
+ps.24h.fam.dab.cipro.otus.t <- as.data.frame(t(ps.24h.fam.dab.cipro.otus))  
+#
+#ps.24h.fam.dab.cipro.otus.t.adj <- ps.24h.fam.dab.cipro.otus.t %>% 
+#  rownames_to_column(var = "sampleID")  %>% 
+#  left_join(key.plus, by = c("sampleID")) %>% 
+#  dplyr::select(!c("sampleID", "date")) %>% 
+#  column_to_rownames(var = "iguanaID")
+ps.phys.24h.dab.cipro.fam.mat <- as.matrix(ps.24h.fam.dab.cipro.otus.t)
+ps.phys.24h.dab.cipro.fam.mat.log <- log10(ps.phys.24h.dab.cipro.fam.mat + 0.01)
+dim(ps.phys.24h.dab.cipro.fam.mat.log)
+```
+
+
+###### Prep ASVs
+
+```{r cor.24h-4}
+#
+ps.24h.dab.cipro.otus <- abundances(ps.24h.dab.cipro)
+ps.24h.dab.cipro.otus.t <- as.data.frame(t(ps.24h.dab.cipro.otus))  
+#
+#ps.24h.dab.cipro.otus.t.adj <- ps.24h.dab.cipro.otus.t %>% 
+#  rownames_to_column(var = "sampleID")  %>% 
+#  left_join(key.plus, by = c("sampleID")) %>% 
+#  dplyr::select(!c("sampleID", "date")) %>% 
+#  column_to_rownames(var = "iguanaID")
+ps.phys.24h.dab.cipro.ASVs.mat <- as.matrix(ps.24h.dab.cipro.otus.t)
+ps.phys.24h.dab.cipro.ASVs.mat.log <- log10(ps.phys.24h.dab.cipro.ASVs.mat + 0.01)
+dim(ps.phys.24h.dab.cipro.ASVs.mat.log)
+```
+
+#### Subset phys data
+
+
+Looking only at BKA and IGy, because these showed the 
+most significant effects of antibiotics. 
+
+```{r cor.24h-5}
+dab24h.cipro.iguanas <- sample_names(ps.24h.dab.cipro)
+phys.24h.cipro <- samples %>% 
+    dplyr::select(sampleID, 
+                jan24bka,  
+                jan24igy) %>% 
+  filter(sampleID %in% dab24h.cipro.iguanas) %>% 
+  column_to_rownames(var = "sampleID")
+phys.24h.cipro.mat <- as.matrix(phys.24h.cipro)
+dim(phys.24h.cipro.mat)
+
+```
+
+#### Correlate
+
+###### ASVs
+
+```{r cor.24h-6}
+dab.cipro24.cors.ASVs <- associate(ps.phys.24h.dab.cipro.ASVs.mat.log, 
+                             phys.24h.cipro.mat, 
+                        method = "pearson", 
+                        mode = "table", 
+                        p.adj.threshold = 0.05, 
+                        n.signif = 0, 
+                        p.adj.method = "BH")
+head(knitr::kable(dab.cipro24.cors.ASVs))
+write.csv(dab.cipro24.cors.ASVs, file = "dab_cipro24h_ASVs.csv", 
+          quote = FALSE, 
+          row.names = FALSE)
+```
+
+
+###### Family
+
+
+```{r cor.24h-7}
+dab.cipro24.cors.fam <- associate(ps.phys.24h.dab.cipro.fam.mat.log, 
+                             phys.24h.cipro.mat, 
+                        method = "pearson", 
+                        mode = "table", 
+                        p.adj.threshold = 0.05, 
+                        n.signif = 0, 
+                        p.adj.method = "BH")
+head(knitr::kable(dab.cipro24.cors.fam))
+write.csv(dab.cipro24.cors.fam, file = "dab_cipro24h_fam.csv", 
+          quote = FALSE, 
+          row.names = FALSE)
+```
+
+
+
+## 24 h Penicillin
+
+
+#### Filter ASVs
+
+```{r cor.24h-8}
+keepTaxa <- rownames(diffab.24h.pen.p05)
+length(keepTaxa)
+# ASVs
+ps.24h.dab.pen <- prune_taxa(keepTaxa, ps.24h)
+ps.24h.dab.pen
+# family
+ps.24h.fam.dab.pen <- prune_taxa(keepTaxa, ps.24h.fam)
+ps.24h.fam.dab.pen
+```
+
+###### Prep families
+
+```{r cor.24h-9}
+#
+ps.24h.fam.dab.pen.otus <- abundances(ps.24h.fam.dab.pen)
+ps.24h.fam.dab.pen.otus.t <- as.data.frame(t(ps.24h.fam.dab.pen.otus))  
+#
+#ps.24h.fam.dab.pen.otus.t.adj <- ps.24h.fam.dab.pen.otus.t %>% 
+#  rownames_to_column(var = "sampleID")  %>% 
+#  left_join(key.plus, by = c("sampleID")) %>% 
+#  dplyr::select(!c("sampleID", "date")) %>% 
+#  column_to_rownames(var = "iguanaID")
+ps.phys.24h.dab.pen.fam.mat <- as.matrix(ps.24h.fam.dab.pen.otus.t)
+ps.phys.24h.dab.pen.fam.mat.log <- log10(ps.phys.24h.dab.pen.fam.mat + 0.01)
+dim(ps.phys.24h.dab.pen.fam.mat.log)
+```
+
+
+###### Prep ASVs
+
+```{r cor.24h-10}
+#
+ps.24h.dab.pen.otus <- abundances(ps.24h.dab.pen)
+ps.24h.dab.pen.otus.t <- as.data.frame(t(ps.24h.dab.pen.otus))  
+#
+#ps.24h.dab.pen.otus.t.adj <- ps.24h.dab.pen.otus.t %>% 
+#  rownames_to_column(var = "sampleID")  %>% 
+#  left_join(key.plus, by = c("sampleID")) %>% 
+#  dplyr::select(!c("sampleID", "date")) %>% 
+#  column_to_rownames(var = "iguanaID")
+ps.phys.24h.dab.pen.ASVs.mat <- as.matrix(ps.24h.dab.pen.otus.t)
+ps.phys.24h.dab.pen.ASVs.mat.log <- log10(ps.phys.24h.dab.pen.ASVs.mat + 0.01)
+dim(ps.phys.24h.dab.pen.ASVs.mat.log)
+```
+
+#### Subset phys data
+
+
+Looking only at BKA and IGy, because these showed the 
+most significant effects of antibiotics. 
+
+```{r cor.24h-11}
+dab24h.pen.iguanas <- sample_names(ps.24h.dab.pen)
+phys.24h.pen <- samples %>% 
+    dplyr::select(sampleID, 
+                jan24bka,  
+                jan24igy) %>% 
+  filter(sampleID %in% dab24h.pen.iguanas) %>% 
+  column_to_rownames(var = "sampleID")
+phys.24h.pen.mat <- as.matrix(phys.24h.pen)
+dim(phys.24h.pen.mat)
+
+```
+
+#### Correlate
+
+###### ASVs
+
+```{r cor.24h-12}
+dab.pen24.cors.ASVs <- associate(ps.phys.24h.dab.pen.ASVs.mat.log, 
+                             phys.24h.pen.mat, 
+                        method = "pearson", 
+                        mode = "table", 
+                        p.adj.threshold = 0.05, 
+                        n.signif = 0, 
+                        p.adj.method = "BH")
+head(knitr::kable(dab.pen24.cors.ASVs))
+write.csv(dab.pen24.cors.ASVs, file = "dab_pen24h_ASVs.csv", 
+          quote = FALSE, 
+          row.names = FALSE)
+```
+
+
+###### Family
+
+
+```{r cor.24h-13}
+dab.pen24.cors.fam <- associate(ps.phys.24h.dab.pen.fam.mat.log, 
+                             phys.24h.pen.mat, 
+                        method = "pearson", 
+                        mode = "table", 
+                        p.adj.threshold = 0.05, 
+                        n.signif = 0, 
+                        p.adj.method = "BH")
+head(knitr::kable(dab.pen24.cors.fam))
+write.csv(dab.pen24.cors.fam, file = "dab_pen24h_fam.csv", 
+          quote = FALSE, 
+          row.names = FALSE)
+```
+
+
+## 2 weeks cipro
+
+#### Agglomerate by family 
+
+```{r cor.2w-1}
+ps.2w.fam <- tax_glom(ps.2w, 'Family')
+```
+
+#### Filter ASVs
+
+```{r cor.2w-2}
+keepTaxa <- rownames(diffab.2w.cipro.p05)
+length(keepTaxa)
+# ASVs
+ps.2w.dab.cipro <- prune_taxa(keepTaxa, ps.2w)
+ps.2w.dab.cipro
+# family
+ps.2w.fam.dab.cipro <- prune_taxa(keepTaxa, ps.2w.fam)
+ps.2w.fam.dab.cipro
+```
+
+###### Prep families
+
+```{r cor.2w-3}
+#
+ps.2w.fam.dab.cipro.otus <- abundances(ps.2w.fam.dab.cipro)
+ps.2w.fam.dab.cipro.otus.t <- as.data.frame(t(ps.2w.fam.dab.cipro.otus))  
+#
+#ps.2w.fam.dab.cipro.otus.t.adj <- ps.2w.fam.dab.cipro.otus.t %>% 
+#  rownames_to_column(var = "sampleID")  %>% 
+#  left_join(key.plus, by = c("sampleID")) %>% 
+#  dplyr::select(!c("sampleID", "date")) %>% 
+#  column_to_rownames(var = "iguanaID")
+ps.phys.2w.dab.cipro.fam.mat <- as.matrix(ps.2w.fam.dab.cipro.otus.t)
+ps.phys.2w.dab.cipro.fam.mat.log <- log10(ps.phys.2w.dab.cipro.fam.mat + 0.01)
+dim(ps.phys.2w.dab.cipro.fam.mat.log)
+```
+
+
+###### Prep ASVs
+
+```{r cor.2w-4}
+#
+ps.2w.dab.cipro.otus <- abundances(ps.2w.dab.cipro)
+ps.2w.dab.cipro.otus.t <- as.data.frame(t(ps.2w.dab.cipro.otus))  
+#
+#ps.2w.dab.cipro.otus.t.adj <- ps.2w.dab.cipro.otus.t %>% 
+#  rownames_to_column(var = "sampleID")  %>% 
+#  left_join(key.plus, by = c("sampleID")) %>% 
+#  dplyr::select(!c("sampleID", "date")) %>% 
+#  column_to_rownames(var = "iguanaID")
+ps.phys.2w.dab.cipro.ASVs.mat <- as.matrix(ps.2w.dab.cipro.otus.t)
+ps.phys.2w.dab.cipro.ASVs.mat.log <- log10(ps.phys.2w.dab.cipro.ASVs.mat + 0.01)
+dim(ps.phys.2w.dab.cipro.ASVs.mat.log)
+```
+
+#### Subset phys data
+
+
+Looking only at BKA and IGy, because these showed the 
+most significant effects of antibiotics. 
+
+```{r cor.2w-5}
+dab2w.cipro.iguanas <- sample_names(ps.2w.dab.cipro)
+phys.2w.cipro <- samples %>% 
+    dplyr::select(sampleID, 
+                feb8bka,  
+                feb8igy) %>% 
+  filter(sampleID %in% dab2w.cipro.iguanas) %>% 
+  column_to_rownames(var = "sampleID")
+phys.2w.cipro.mat <- as.matrix(phys.2w.cipro)
+dim(phys.2w.cipro.mat)
+
+```
+
+#### Correlate
+
+###### ASVs
+
+```{r cor.2w-6}
+dab.cipro2w.cors.ASVs <- associate(ps.phys.2w.dab.cipro.ASVs.mat.log, 
+                             phys.2w.cipro.mat, 
+                        method = "spearman", 
+                        mode = "table", 
+                        p.adj.threshold = 0.05, 
+                        n.signif = 0, 
+                        p.adj.method = "BH")
+head(knitr::kable(dab.cipro2w.cors.ASVs))
+write.csv(dab.cipro2w.cors.ASVs, file = "dab_cipro2w_ASVs.csv", 
+          quote = FALSE, 
+          row.names = FALSE)
+```
+
+
+###### Family
+
+
+```{r cor.2w-7}
+dab.cipro2w.cors.fam <- associate(ps.phys.2w.dab.cipro.fam.mat.log, 
+                             phys.2w.cipro.mat, 
+                        method = "spearman", 
+                        mode = "table", 
+                        p.adj.threshold = 0.05, 
+                        n.signif = 0, 
+                        p.adj.method = "BH")
+head(knitr::kable(dab.cipro2w.cors.fam))
+write.csv(dab.cipro2w.cors.fam, file = "dab_cipro2w_fam.csv", 
+          quote = FALSE, 
+          row.names = FALSE)
+```
+
+## 2 weeks Penicillin
+
+
+#### Filter ASVs
+
+```{r cor.2w-8}
+keepTaxa <- rownames(diffab.2w.pen.p05)
+length(keepTaxa)
+# ASVs
+ps.2w.dab.pen <- prune_taxa(keepTaxa, ps.2w)
+ps.2w.dab.pen
+# family
+ps.2w.fam.dab.pen <- prune_taxa(keepTaxa, ps.2w.fam)
+ps.2w.fam.dab.pen
+```
+
+###### Prep families
+
+```{r cor.2w-9}
+#
+ps.2w.fam.dab.pen.otus <- abundances(ps.2w.fam.dab.pen)
+ps.2w.fam.dab.pen.otus.t <- as.data.frame(t(ps.2w.fam.dab.pen.otus))  
+#
+#ps.2w.fam.dab.pen.otus.t.adj <- ps.2w.fam.dab.pen.otus.t %>% 
+#  rownames_to_column(var = "sampleID")  %>% 
+#  left_join(key.plus, by = c("sampleID")) %>% 
+#  dplyr::select(!c("sampleID", "date")) %>% 
+#  column_to_rownames(var = "iguanaID")
+ps.phys.2w.dab.pen.fam.mat <- as.matrix(ps.2w.fam.dab.pen.otus.t)
+ps.phys.2w.dab.pen.fam.mat.log <- log10(ps.phys.2w.dab.pen.fam.mat + 0.01)
+dim(ps.phys.2w.dab.pen.fam.mat.log)
+```
+
+
+###### Prep ASVs
+
+```{r cor.2w-10}
+#
+ps.2w.dab.pen.otus <- abundances(ps.2w.dab.pen)
+ps.2w.dab.pen.otus.t <- as.data.frame(t(ps.2w.dab.pen.otus))  
+#
+#ps.2w.dab.pen.otus.t.adj <- ps.2w.dab.pen.otus.t %>% 
+#  rownames_to_column(var = "sampleID")  %>% 
+#  left_join(key.plus, by = c("sampleID")) %>% 
+#  dplyr::select(!c("sampleID", "date")) %>% 
+#  column_to_rownames(var = "iguanaID")
+ps.phys.2w.dab.pen.ASVs.mat <- as.matrix(ps.2w.dab.pen.otus.t)
+ps.phys.2w.dab.pen.ASVs.mat.log <- log10(ps.phys.2w.dab.pen.ASVs.mat + 0.01)
+dim(ps.phys.2w.dab.pen.ASVs.mat.log)
+```
+
+#### Subset phys data
+
+
+Looking only at BKA and IGy, because these showed the 
+most significant effects of antibiotics. 
+
+```{r cor.2w-11}
+dab2w.pen.iguanas <- sample_names(ps.2w.dab.pen)
+phys.2w.pen <- samples %>% 
+    dplyr::select(sampleID, 
+                jan24bka,  
+                jan24igy) %>% 
+  filter(sampleID %in% dab2w.pen.iguanas) %>% 
+  column_to_rownames(var = "sampleID")
+phys.2w.pen.mat <- as.matrix(phys.2w.pen)
+dim(phys.2w.pen.mat)
+
+```
+
+#### Correlate
+
+###### ASVs
+
+```{r cor.2w-12}
+dab.pen2w.cors.ASVs <- associate(ps.phys.2w.dab.pen.ASVs.mat.log, 
+                             phys.2w.pen.mat, 
+                        method = "spearman", 
+                        mode = "table", 
+                        p.adj.threshold = 0.05, 
+                        n.signif = 0, 
+                        p.adj.method = "BH")
+head(knitr::kable(dab.pen2w.cors.ASVs))
+write.csv(dab.pen2w.cors.ASVs, file = "dab_pen2w_ASVs.csv", 
+          quote = FALSE, 
+          row.names = FALSE)
+```
+
+
+###### Family
+
+
+```{r cor.2w-13}
+dab.pen2w.cors.fam <- associate(ps.phys.2w.dab.pen.fam.mat.log, 
+                             phys.2w.pen.mat, 
+                        method = "spearman", 
+                        mode = "table", 
+                        p.adj.threshold = 0.05, 
+                        n.signif = 0, 
+                        p.adj.method = "BH")
+head(knitr::kable(dab.pen2w.cors.fam))
+write.csv(dab.pen2w.cors.fam, file = "dab_pen2w_fam.csv", 
+          quote = FALSE, 
+          row.names = FALSE)
+```
+
+# Save
+
+```{r save-1}
+save(samples, 
+     ps, 
+     ps.rab, 
+     ps.log, 
+     ps.rare, 
+     ps.rare.rab, 
+     ps.rare.log, 
+     ps.decon, 
+     ps.decon.rare, 
+     file = "abx16sdata.rda")
+```
+
+# Clear environment
+
+```{r clear}
+rm(list = ls())
+```
+
+# Bookkeeping
+
+```{r book-1}
+sessionInfo()
+```
